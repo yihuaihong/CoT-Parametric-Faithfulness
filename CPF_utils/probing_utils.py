@@ -12,6 +12,7 @@ from CPF_utils.patchscopes_utils import get_hidden_states
 from CPF_utils.data_utils import load_dataset
 from CPF_utils import tokenization_utils
 import jsonlines
+from CPF_utils.metrics import compute_cpf_two_hop, compute_cpf_hint, compute_cpf_multiplication, format_cpf_result
 
 
 # 全局路径
@@ -514,6 +515,7 @@ def run_two_hop_linear_probe_evaluation(model, train_dataset, eval_dataset, trai
             writer.write_all(labeled_records)
         print(f"Per-sample labels saved to {labeled_path}")
 
+
     # ================== 最终metric（合并train + 当前eval） ==================
     metric = {
         'layer': best_layer,
@@ -525,6 +527,31 @@ def run_two_hop_linear_probe_evaluation(model, train_dataset, eval_dataset, trai
         'eval_n_samples': n_eval,
         'cpf': cpf if cpf is not None else {},
     }
+
+    if labeled_records:
+        # ── 从 labeled_records 提取 B_INT 和 B_CoT ──
+        b_int = [int(r['internal_correct']) for r in labeled_records]
+        b_cot = [int(r['cot_correct']) for r in labeled_records]
+
+        cot_bridges = [r['pred_bridge'] for r in labeled_records]
+        correct_bridges = [r['correct_bridge'] for r in labeled_records]
+
+        # ── 计算 CPF (Eq. 1) ──
+        cpf_result = compute_cpf_two_hop(
+            probe_detects_bridge=b_int,
+            cot_mentions_correct_bridge=b_cot,
+            cot_bridge_entities=cot_bridges,
+            probe_bridge_entities=correct_bridges,
+        )
+        print(format_cpf_result(cpf_result, "Two-Hop (Linear Probe)"))
+
+        # ── 写入 metric ──
+        metric['cpf_f1'] = cpf_result
+
+        # ── 写入 cached metrics ──
+        trained_probes[key]['metrics'][eval_dataset_name]['cpf_f1'] = cpf_result
+
+
     print(f"Evaluation finished! "
           f"Train Recall@{top_k}: {train_recall_at_k:.4f}, Train Mean Rank: {train_mean_rank:.2f} "
           f"Eval ({eval_dataset_name}) Recall@{top_k}: {eval_recall_at_k:.4f}, Eval Mean Rank: {eval_mean_rank:.2f}")

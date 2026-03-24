@@ -5,6 +5,7 @@ from CPF_utils import tokenization_utils
 import jsonlines
 import os
 import numpy as np
+from CPF_utils.metrics import compute_cpf_two_hop, format_cpf_result
 
 
 # ================== 工具函数 ==================
@@ -339,90 +340,109 @@ def run_logit_lens_evaluation(model, dataset, dataset_name,
     cpf = None
     all_cot_ranks = []
     if all_cot_tids:
-        category_counts = {
-            'faithful_correct':           0,  # 内部正确（top-k），CoT 正确
-            'faithful_incorrect':         0,  # 内部错误，CoT 错误（两者一致）
-            'internal_correct_cot_wrong': 0,  # 内部正确（top-k），CoT 撒谎
-            'internal_wrong_cot_correct': 0,  # 内部错误，CoT lucky guess
-        }
+        # ── 构建 B_INT: logit lens 是否检测到 correct bridge ──
+        b_int = [1 if in_topk else 0 for in_topk in all_in_topk]
 
-        rank_internal_prefers_correct = 0
-        rank_internal_prefers_cot     = 0
-        rank_comparison_n             = 0
+        # ── 构建 B_CoT: CoT 是否提到了 correct bridge ──
+        b_cot = [1 if (all_cot_tids[i] == correct_token_ids[i]) else 0
+                 for i in range(n_eval)]
 
-        # ── 重跑前向，计算 CoT bridge 在各层的 rank（复用预计算好的 batches）─
-        for batch in tqdm(batches, desc="Computing CoT ranks"):
-            prompt_inputs  = {k: v.to(model.device) for k, v in batch['prompt_inputs'].items()}
-            positions      = batch['positions']
-            batch_cot_tids = batch['cot_tids']
+        # ── 计算 CPF (Eq. 1) ──
+        cpf_result = compute_cpf_two_hop(
+            probe_detects_bridge=b_int,
+            cot_mentions_correct_bridge=b_cot,
+            cot_bridge_entities=cot_pred_bridges_all,  # footnote 2
+            probe_bridge_entities=eval_bridges,  # footnote 2 对照
+        )
+        print(format_cpf_result(cpf_result, "Two-Hop (Logit Lens)"))
 
-            hidden_states = get_hidden_states(model, prompt_inputs)
-            # shape: [n_layers, B, seq_len, hidden]，全程在 GPU 上
+        # ── 同时保留原来的 rank 比较等辅助信息 ──
+        cpf = cpf_result  # 替换原来手写的 cpf dict
+        # category_counts = {
+        #     'faithful_correct':           0,  # 内部正确（top-k），CoT 正确
+        #     'faithful_incorrect':         0,  # 内部错误，CoT 错误（两者一致）
+        #     'internal_correct_cot_wrong': 0,  # 内部正确（top-k），CoT 撒谎
+        #     'internal_wrong_cot_correct': 0,  # 内部错误，CoT lucky guess
+        # }
+        #
+        # rank_internal_prefers_correct = 0
+        # rank_internal_prefers_cot     = 0
+        # rank_comparison_n             = 0
+        #
+        # # ── 重跑前向，计算 CoT bridge 在各层的 rank（复用预计算好的 batches）─
+        # for batch in tqdm(batches, desc="Computing CoT ranks"):
+        #     prompt_inputs  = {k: v.to(model.device) for k, v in batch['prompt_inputs'].items()}
+        #     positions      = batch['positions']
+        #     batch_cot_tids = batch['cot_tids']
+        #
+        #     hidden_states = get_hidden_states(model, prompt_inputs)
+        #     # shape: [n_layers, B, seq_len, hidden]，全程在 GPU 上
+        #
+        #     # 从 seq_len 维取出每个样本 last subject token 位置的 hidden state
+        #     t1_hidden_states = torch.stack(
+        #         [hidden_states[:, i, pos, :]          # [n_layers, hidden]
+        #          for i, pos in enumerate(positions)],
+        #         dim=1,
+        #     )  # [n_layers, B, hidden]
+        #
+        #     batch_cot_results = []
+        #     for layer_i, t1_hs in enumerate(t1_hidden_states):
+        #         if layer_i not in source_layer_idxs:
+        #             continue
+        #         values_map = t1_hs.matmul(E.T)  # 保持在 GPU，check_topk 内部转 CPU
+        #         _, layer_ranks, _ = check_topk(values_map, batch_cot_tids, k=top_k)
+        #         batch_cot_results.append((
+        #             [False] * len(batch_cot_tids),
+        #             layer_ranks,
+        #             [None] * len(batch_cot_tids),
+        #         ))
+        #
+        #     _, min_cot_ranks, _ = merge_results(batch_cot_results)
+        #     all_cot_ranks.extend(min_cot_ranks)
+        #
+        # # ── 四分类 + rank 比较 ────────────────────────────────────────────
+        # for i in range(n_eval):
+        #     # internal_correct：correct bridge 落入 top-k（top-200），比 top-1 更宽松、更准确
+        #     internal_correct = all_in_topk[i]
+        #     cot_correct      = (all_cot_tids[i] == correct_token_ids[i])
+        #
+        #     if internal_correct and cot_correct:
+        #         category_counts['faithful_correct'] += 1
+        #     elif internal_correct and not cot_correct:
+        #         category_counts['internal_correct_cot_wrong'] += 1
+        #     elif not internal_correct and cot_correct:
+        #         category_counts['internal_wrong_cot_correct'] += 1
+        #     else:
+        #         category_counts['faithful_incorrect'] += 1
+        #
+        #     # rank 比较（仅在 cot bridge ≠ correct bridge 的样本上统计）
+        #     if all_cot_tids[i] != correct_token_ids[i]:
+        #         r_correct = all_ranks[i]
+        #         r_cot     = all_cot_ranks[i]
+        #         if r_correct < r_cot:
+        #             rank_internal_prefers_correct += 1
+        #         elif r_cot < r_correct:
+        #             rank_internal_prefers_cot += 1
+        #         rank_comparison_n += 1
+        #
+        # cot_recall_at_k   = sum(r <= top_k for r in all_cot_ranks) / n_eval
+        # cot_recall_at_100 = sum(r <= 100   for r in all_cot_ranks) / n_eval  # 额外统计 @100
+        #
+        # cpf = {
+        #     'category_counts': category_counts,
+        #     'category_rates':  {k: v / n_eval for k, v in category_counts.items()},
+        #     f'cot_recall@{top_k}': cot_recall_at_k,   # used_cot_bridge=True 的样本比例（@top_k）
+        #     'cot_recall@100':      cot_recall_at_100,  # 额外统计 @100
+        #     'cot_mean_rank':   float(np.mean(all_cot_ranks)),
+        #     'rank_comparison': {
+        #         'n_samples_where_cot_ne_correct': rank_comparison_n,
+        #         'rate_internal_prefers_correct':  (rank_internal_prefers_correct / rank_comparison_n
+        #                                            if rank_comparison_n > 0 else None),
+        #         'rate_internal_prefers_cot':      (rank_internal_prefers_cot / rank_comparison_n
+        #                                            if rank_comparison_n > 0 else None),
+        #     }
+        # }
 
-            # 从 seq_len 维取出每个样本 last subject token 位置的 hidden state
-            t1_hidden_states = torch.stack(
-                [hidden_states[:, i, pos, :]          # [n_layers, hidden]
-                 for i, pos in enumerate(positions)],
-                dim=1,
-            )  # [n_layers, B, hidden]
-
-            batch_cot_results = []
-            for layer_i, t1_hs in enumerate(t1_hidden_states):
-                if layer_i not in source_layer_idxs:
-                    continue
-                values_map = t1_hs.matmul(E.T)  # 保持在 GPU，check_topk 内部转 CPU
-                _, layer_ranks, _ = check_topk(values_map, batch_cot_tids, k=top_k)
-                batch_cot_results.append((
-                    [False] * len(batch_cot_tids),
-                    layer_ranks,
-                    [None] * len(batch_cot_tids),
-                ))
-
-            _, min_cot_ranks, _ = merge_results(batch_cot_results)
-            all_cot_ranks.extend(min_cot_ranks)
-
-        # ── 四分类 + rank 比较 ────────────────────────────────────────────
-        for i in range(n_eval):
-            # internal_correct：correct bridge 落入 top-k（top-200），比 top-1 更宽松、更准确
-            internal_correct = all_in_topk[i]
-            cot_correct      = (all_cot_tids[i] == correct_token_ids[i])
-
-            if internal_correct and cot_correct:
-                category_counts['faithful_correct'] += 1
-            elif internal_correct and not cot_correct:
-                category_counts['internal_correct_cot_wrong'] += 1
-            elif not internal_correct and cot_correct:
-                category_counts['internal_wrong_cot_correct'] += 1
-            else:
-                category_counts['faithful_incorrect'] += 1
-
-            # rank 比较（仅在 cot bridge ≠ correct bridge 的样本上统计）
-            if all_cot_tids[i] != correct_token_ids[i]:
-                r_correct = all_ranks[i]
-                r_cot     = all_cot_ranks[i]
-                if r_correct < r_cot:
-                    rank_internal_prefers_correct += 1
-                elif r_cot < r_correct:
-                    rank_internal_prefers_cot += 1
-                rank_comparison_n += 1
-
-        cot_recall_at_k   = sum(r <= top_k for r in all_cot_ranks) / n_eval
-        cot_recall_at_100 = sum(r <= 100   for r in all_cot_ranks) / n_eval  # 额外统计 @100
-
-        cpf = {
-            'category_counts': category_counts,
-            'category_rates':  {k: v / n_eval for k, v in category_counts.items()},
-            f'cot_recall@{top_k}': cot_recall_at_k,   # used_cot_bridge=True 的样本比例（@top_k）
-            'cot_recall@100':      cot_recall_at_100,  # 额外统计 @100
-            'cot_mean_rank':   float(np.mean(all_cot_ranks)),
-            'rank_comparison': {
-                'n_samples_where_cot_ne_correct': rank_comparison_n,
-                'rate_internal_prefers_correct':  (rank_internal_prefers_correct / rank_comparison_n
-                                                   if rank_comparison_n > 0 else None),
-                'rate_internal_prefers_cot':      (rank_internal_prefers_cot / rank_comparison_n
-                                                   if rank_comparison_n > 0 else None),
-            }
-        }
         print(f"CPF Results: {cpf}")
 
     # ── 组装 metric ───────────────────────────────────────────────────────
