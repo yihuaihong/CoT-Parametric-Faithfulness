@@ -1,0 +1,827 @@
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score
+import time
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
+import numpy as np
+import os
+from tqdm import tqdm  # 可选，用于进度条
+import pandas as pd
+from CPF_utils.patchscopes_utils import get_hidden_states
+from CPF_utils.data_utils import load_dataset
+from CPF_utils import tokenization_utils
+import jsonlines
+
+
+# 全局路径
+SAVE_DIR = "/scratch/yh6210/results/open-r1/probing_results"
+os.makedirs(SAVE_DIR, exist_ok=True)  # 自动创建目录
+
+# 全局存储（从磁盘加载）
+trained_probes = {}
+probe_cache_file = os.path.join(SAVE_DIR, "trained_probes_cache.pth")
+
+# 在函数开头加载缓存（如果存在）
+if os.path.exists(probe_cache_file):
+    print(f"Loading trained probes from {probe_cache_file}...")
+    trained_probes = torch.load(probe_cache_file, map_location='cpu', weights_only=False)
+
+
+# 预存的best layer dict（key改为 (model_name, train_dataset_name)）
+best_layer_dict = {
+    # 示例：{('Llama-2-7b-hf', 'onehop_dataset'): 21, ...}
+    # 如果没有，会默认用中间层
+}
+
+
+def run_two_hop_linear_probe_evaluation(model, train_dataset, eval_dataset, train_dataset_name,
+                                        eval_dataset_name, eval_dataset_responses_path,
+                                        tokenizer, batch_size=64, top_k=200,
+                                        output_path=None, seed=8888):
+    """
+    - probe缓存key基于 (model_name, train_dataset_name)
+    - metrics存为dict: {'train': train_metric, eval_name1: eval_metric1, ...}
+    - 如果probe已训好，直接用；如果有对应eval_name的metric，直接返回；否则计算missing的eval metric
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    model.eval()
+
+    model_name = getattr(model.config, '_name_or_path', 'unknown_model')
+    if '/' in model_name:
+        model_name = model_name.split('/')[-1]
+
+    interp_tool = "linear_probe"   # 供文件名使用，与 logit lens 对齐
+
+    # 新key：基于train_dataset_name
+    key = (model_name, train_dataset_name)
+
+    # 关键修复：始终定义n_train和n_eval（无论cached与否）
+    n_train = len(train_dataset)
+    n_eval = len(eval_dataset)
+
+    # 决定层（基于train_dataset_name）
+    n_layers = len(model.model.layers)
+    best_layer = best_layer_dict.get(key)
+    if best_layer is None:
+        best_layer = n_layers // 2
+        print(f"No predefined best layer, using default middle layer {best_layer}/{n_layers-1}")
+    else:
+        print(f"Using predefined best layer {best_layer}/{n_layers-1}")
+
+    # 检查train_dataset列
+    train_prompt_col = 'r1(e1).prompt'
+    train_bridge_col = 'e2.value'
+    train_subject_col = 'r1(e1).subject_cut.prompt'
+    for col in [train_prompt_col, train_bridge_col, train_subject_col]:
+        if col not in train_dataset.columns:
+            raise ValueError(f"train_dataset缺少必要列: {col}")
+
+    # 检查eval_dataset列
+    eval_prompt_col = 'r2(r1(e1)).prompt'
+    eval_bridge_col = 'e2.value'
+    eval_subject_col = 'r2(r1(e1)).subject_cut.prompt'
+    for col in [eval_prompt_col, eval_bridge_col, eval_subject_col]:
+        if col not in eval_dataset.columns:
+            raise ValueError(f"eval_dataset缺少必要列: {col}")
+
+    # ================== 如果probe已缓存 ==================
+    if key in trained_probes:
+        data = trained_probes[key]
+        probe = data['probe'].to(device)
+        cached_metrics = data.get('metrics', {})
+        layer = data['layer']
+
+        print(f"Linear Probe already trained for Model {model_name} with Train Dataset {train_dataset_name} (layer {layer})")
+
+        # 如果已有当前eval_dataset_name的metric，直接返回完整metric
+        if eval_dataset_name in cached_metrics:
+            print(f"Metric for eval_dataset {eval_dataset_name} already cached, returning...")
+            full_metric = cached_metrics.get('train', {}).copy()
+            full_metric.update(cached_metrics[eval_dataset_name])
+            full_metric['layer'] = layer
+            return full_metric
+
+        # 否则：probe已训，只计算missing的eval metric（和train metric可选）
+        print(f"Probe cached, but no metric for eval_dataset {eval_dataset_name}, computing eval metric...")
+
+    else:
+        # ================== 需要训练probe ==================
+        print(f"starting to train Linear Probe for Model {model_name} using Train Dataset {train_dataset_name} for eval on {eval_dataset_name}...")
+
+        # 训练集收集
+        train_hs_list = []
+        train_labels_chunk_list = []
+
+        train_prompts = train_dataset[train_prompt_col].astype(str).tolist()
+        train_bridges = train_dataset[train_bridge_col].astype(str).tolist()
+        train_subjects = train_dataset[train_subject_col].astype(str).tolist()
+
+        for start_idx in tqdm(range(0, n_train, batch_size), desc="Collecting train hidden states"):
+            end_idx = min(start_idx + batch_size, n_train)
+            batch_prompts = train_prompts[start_idx:end_idx]
+            batch_bridges = train_bridges[start_idx:end_idx]
+            batch_subjects = train_subjects[start_idx:end_idx]
+
+            first_token_ids = []
+            for bridge in batch_bridges:
+                if not bridge or bridge in ('nan', 'null'):
+                    first_token_ids.append(tokenizer.unk_token_id) #检测是否能在hs中看到first token of bridge
+                    continue
+                tokens = tokenizer.encode(bridge.strip(), add_special_tokens=False)
+                first_token_ids.append(tokens[0] if tokens else tokenizer.unk_token_id)
+            train_labels_chunk_list.append(first_token_ids)
+
+            inputs = tokenizer(batch_prompts, padding=True, truncation=True, return_tensors='pt', max_length=512).to(device)
+
+            last_subject_token_positions = tokenization_utils.find_exact_substrings_token_positions_from_tensor(
+                tokenizer, inputs["input_ids"], batch_subjects
+            )
+
+            with torch.no_grad():
+                outputs = model(**inputs, output_hidden_states=True)
+                hidden = outputs.hidden_states[best_layer + 1]
+
+                seq_lens = inputs['attention_mask'].sum(dim=1) - 1
+                positions = [seq_lens[i].item() if pos < 0 else pos for i, pos in enumerate(last_subject_token_positions)]
+                positions = torch.tensor(positions, device=device)
+
+                batch_indices = torch.arange(hidden.size(0), device=device)
+                batch_hs = hidden[batch_indices, positions, :].cpu()
+                train_hs_list.append(batch_hs)
+
+        # 训练probe（分chunk）
+        hidden_dim = train_hs_list[0].shape[1]
+        vocab_size = len(tokenizer)
+
+        probe = nn.Linear(hidden_dim, vocab_size).to(device)
+        optimizer = torch.optim.AdamW(probe.parameters(), lr=1e-3, weight_decay=0.01)
+        criterion = nn.CrossEntropyLoss()
+
+        probe.train()
+        n_epochs = 15 #这个应该是个超参数，关于 interp tool训练的精度
+        for epoch in range(n_epochs):
+            total_loss = 0.0
+            chunk_indices = np.random.permutation(len(train_hs_list))
+            for i in chunk_indices:
+                batch_hs = train_hs_list[i].to(device)
+                batch_labels = torch.tensor(train_labels_chunk_list[i], device=device)
+
+                optimizer.zero_grad()
+                logits = probe(batch_hs)
+                loss = criterion(logits, batch_labels)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+            print(f"Epoch {epoch + 1}/{n_epochs} - Loss: {total_loss / len(train_hs_list):.4f}")
+
+        # 初始化cached data
+        trained_probes[key] = {
+            'probe': probe.cpu(),
+            'layer': best_layer,
+            'metrics': {}  # 将在此填充
+        }
+
+    def evaluate_on_dataset(hs_list, labels_chunk_list, dataset_name, n_samples, pred_bridge_labels_chunk_list=None):
+        total_correct = 0
+        pred_in_hs_total_correct = 0
+        all_ranks = []
+        pred_bridge_all_ranks = []
+
+        # faithfulness四分类计数
+        category_counts = {
+            'faithful_correct': 0,  # 内部正确，CoT正确
+            'faithful_incorrect': 0,  # 内部错误，CoT错误（两者一致）
+            'internal_correct_cot_wrong': 0,  # 内部正确，CoT撒谎了
+            'internal_wrong_cot_correct': 0,  # 内部错误，CoT lucky guess
+        }
+
+        # rank比较计数（仅在cot bridge != correct bridge的样本上统计）
+        rank_internal_prefers_correct = 0  # rank_correct < rank_cot
+        rank_internal_prefers_cot = 0  # rank_cot < rank_correct
+        rank_comparison_n = 0
+
+        # 用于 per-sample 打标（仅在有 CoT 时收集）
+        per_sample_top1       = []  # probe top-1 token id
+        per_sample_cr         = []  # rank of correct bridge
+        per_sample_cotr       = []  # rank of cot bridge
+        per_sample_cot_intopk = []  # cot bridge in top-k?
+
+        probe.to(device)
+        probe.eval()
+        with torch.no_grad():
+            for i in tqdm(range(len(hs_list)), desc=f"Evaluating on {dataset_name}"):
+                batch_hs = hs_list[i].to(device)
+                batch_labels = torch.tensor(labels_chunk_list[i], device=device)  # [B]
+
+                logits = probe(batch_hs)  # [B, vocab]
+                sorted_indices = logits.argsort(dim=-1, descending=True)  # [B, vocab]
+
+                # ── Recall@K（correct bridge）──────────────────────────────────
+                topk_indices = sorted_indices[:, :top_k]  # [B, top_k]
+                correct = (topk_indices == batch_labels.unsqueeze(1)).any(dim=1)
+                total_correct += correct.sum().item()
+
+                # ── Rank of correct bridge（argmax比nonzero更稳健）─────────────
+                correct_match = (sorted_indices == batch_labels.unsqueeze(1))  # [B, vocab]
+                correct_ranks = correct_match.float().argmax(dim=1) + 1  # [B]
+                all_ranks.extend(correct_ranks.cpu().tolist())
+
+                # ── 以下仅在提供了cot pred_bridge时执行 ───────────────────────
+                if pred_bridge_labels_chunk_list is not None:
+                    pred_bridge_labels = torch.tensor(pred_bridge_labels_chunk_list[i], device=device)  # [B]
+
+                    # Recall@K（cot bridge在probe top-k里的比例）
+                    pred_in_hs = (topk_indices == pred_bridge_labels.unsqueeze(1)).any(dim=1)
+                    pred_in_hs_total_correct += pred_in_hs.sum().item()
+
+                    # Rank of cot bridge
+                    cot_match = (sorted_indices == pred_bridge_labels.unsqueeze(1))  # [B, vocab]
+                    cot_ranks = cot_match.float().argmax(dim=1) + 1  # [B]
+                    pred_bridge_all_ranks.extend(cot_ranks.cpu().tolist())
+
+                    # ── Faithfulness四分类 ─────────────────────────────────────
+                    # 用probe top-1作为"内部bridge"的代理
+                    probe_top1 = sorted_indices[:, 0]  # [B]
+                    internal_correct = (probe_top1 == batch_labels)  # [B] bool
+                    cot_correct = (pred_bridge_labels == batch_labels)  # [B] bool
+
+                    for b in range(batch_labels.size(0)):
+                        ic, cc = internal_correct[b].item(), cot_correct[b].item()
+                        if ic and cc:
+                            category_counts['faithful_correct'] += 1
+                        elif ic and not cc:
+                            category_counts['internal_correct_cot_wrong'] += 1
+                        elif not ic and cc:
+                            category_counts['internal_wrong_cot_correct'] += 1
+                        else:
+                            category_counts['faithful_incorrect'] += 1
+
+                    # ── Rank比较（仅在cot bridge ≠ correct bridge的样本）────────
+                    different_mask = (pred_bridge_labels != batch_labels)  # [B]
+                    if different_mask.any():
+                        diff_correct_ranks = correct_ranks[different_mask]
+                        diff_cot_ranks = cot_ranks[different_mask]
+                        rank_internal_prefers_correct += (diff_correct_ranks < diff_cot_ranks).sum().item()
+                        rank_internal_prefers_cot += (diff_cot_ranks < diff_correct_ranks).sum().item()
+                        rank_comparison_n += different_mask.sum().item()
+
+                    # ── 收集 per-sample 打标所需数据 ──────────────────────────
+                    per_sample_top1.extend(probe_top1.cpu().tolist())
+                    per_sample_cr.extend(correct_ranks.cpu().tolist())
+                    per_sample_cotr.extend(cot_ranks.cpu().tolist())
+                    per_sample_cot_intopk.extend(pred_in_hs.cpu().tolist())
+
+        # ── 汇总指标 ──────────────────────────────────────────────────────────
+        recall_at_k = total_correct / n_samples
+        mean_rank = np.mean(all_ranks)
+
+        if pred_bridge_labels_chunk_list is None:
+            return recall_at_k, mean_rank
+
+        cpf = {
+            'category_counts': category_counts,
+            'category_rates': {k: v / n_samples for k, v in category_counts.items()},
+            f'pred_recall@{top_k}': pred_in_hs_total_correct / n_samples,
+            'pred_mean_rank': np.mean(pred_bridge_all_ranks),
+            'rank_comparison': {
+                'n_samples_where_cot_ne_correct': rank_comparison_n,
+                'rate_internal_prefers_correct': rank_internal_prefers_correct / rank_comparison_n if rank_comparison_n > 0 else None,
+                'rate_internal_prefers_cot': rank_internal_prefers_cot / rank_comparison_n if rank_comparison_n > 0 else None,
+            }
+        }
+
+        per_sample_info = {
+            'probe_top1':  per_sample_top1,
+            'rank_correct': per_sample_cr,
+            'rank_cot':    per_sample_cotr,
+            'cot_in_topk': per_sample_cot_intopk,
+        }
+
+        return recall_at_k, mean_rank, cpf, per_sample_info
+
+    # ================== 计算train metric（始终计算或缓存） ==================
+    if 'train' not in trained_probes[key]['metrics']:
+        print("Computing train metric...")
+        # 如果cached但无train metric，重新收集train hs（train_hs_list可能不存在，所以重新收集）
+        train_hs_list = []
+        train_labels_chunk_list = []
+
+        train_prompts = train_dataset[train_prompt_col].astype(str).tolist()
+        train_bridges = train_dataset[train_bridge_col].astype(str).tolist()
+        train_subjects = train_dataset[train_subject_col].astype(str).tolist()
+
+        for start_idx in tqdm(range(0, n_train, batch_size), desc="Re-collecting train hidden states for metric"):
+            end_idx = min(start_idx + batch_size, n_train)
+            batch_prompts = train_prompts[start_idx:end_idx]
+            batch_bridges = train_bridges[start_idx:end_idx]
+            batch_subjects = train_subjects[start_idx:end_idx]
+
+            first_token_ids = []
+            for bridge in batch_bridges:
+                if not bridge or bridge in ('nan', 'null'):
+                    first_token_ids.append(tokenizer.unk_token_id)
+                    continue
+                tokens = tokenizer.encode(bridge.strip(), add_special_tokens=False)
+                first_token_ids.append(tokens[0] if tokens else tokenizer.unk_token_id)
+            train_labels_chunk_list.append(first_token_ids)
+
+            inputs = tokenizer(batch_prompts, padding=True, truncation=True, return_tensors='pt', max_length=512).to(device)
+
+            last_subject_token_positions = tokenization_utils.find_exact_substrings_token_positions_from_tensor(
+                tokenizer, inputs["input_ids"], batch_subjects
+            )
+
+            with torch.no_grad():
+                outputs = model(**inputs, output_hidden_states=True)
+                hidden = outputs.hidden_states[best_layer + 1]
+
+                seq_lens = inputs['attention_mask'].sum(dim=1) - 1
+                positions = [seq_lens[i].item() if pos < 0 else pos for i, pos in enumerate(last_subject_token_positions)]
+                positions = torch.tensor(positions, device=device)
+
+                batch_indices = torch.arange(hidden.size(0), device=device)
+                batch_hs = hidden[batch_indices, positions, :].cpu()
+                train_hs_list.append(batch_hs)
+
+        train_recall_at_k, train_mean_rank = evaluate_on_dataset(
+            train_hs_list, train_labels_chunk_list, "train_dataset", n_train
+        )
+        trained_probes[key]['metrics']['train'] = {
+            'train_recall@{}'.format(top_k): train_recall_at_k,
+            'train_mean_rank': train_mean_rank,
+            'train_n_samples': n_train
+        }
+    else:
+        train_metric = trained_probes[key]['metrics']['train']
+        train_recall_at_k = train_metric['train_recall@{}'.format(top_k)]
+        train_mean_rank = train_metric['train_mean_rank']
+
+    # ================== 计算eval metric（如果missing） ==================
+    cpf             = None
+    per_sample_info = None
+    cot_pred_bridges = None
+
+    if eval_dataset_name not in trained_probes[key]['metrics']:
+        print(f"Computing metric for eval_dataset {eval_dataset_name}...")
+        eval_hs_list = []
+        eval_labels_chunk_list = []
+        pred_bridge_labels_chunk_list = []
+
+        eval_prompts = eval_dataset[eval_prompt_col].astype(str).tolist() #所以我现在很怀疑这里就是不带cot的，是需要带cot的
+        eval_bridges = eval_dataset[eval_bridge_col].astype(str).tolist()
+        eval_subjects = eval_dataset[eval_subject_col].astype(str).tolist()
+        print(f"The size of eval_dataset {eval_dataset_name} is {n_eval} samples.")
+
+        if eval_dataset_responses_path is not None:
+            # 读取jsonl文件
+            cot_records = []
+            with jsonlines.open(eval_dataset_responses_path, 'r') as reader:
+                for record in reader:
+                    cot_records.append(record)
+
+            assert len(cot_records) == n_eval, (
+                f"jsonl文件样本数({len(cot_records)})与eval_dataset样本数({n_eval})不一致"
+            )
+
+            # 验证correct_bridge与eval_dataset的e2.value次序一致
+            for i, (record, bridge_gt) in enumerate(zip(cot_records, eval_bridges)):
+                assert record['correct_bridge'] == bridge_gt, (
+                    f"第{i}条样本的correct_bridge不一致: "
+                    f"jsonl中为'{record['correct_bridge']}', "
+                    f"eval_dataset中为'{bridge_gt}'"
+                )
+
+            # 提取pred_bridge列表，留着循环里按index使用
+            cot_pred_bridges = [record['pred_bridge'] for record in cot_records]
+            print(f"成功读取{len(cot_pred_bridges)}条CoT pred_bridge")
+
+        for start_idx in tqdm(range(0, n_eval, batch_size), desc="Collecting eval hidden states"):
+            end_idx = min(start_idx + batch_size, n_eval)
+            batch_prompts = eval_prompts[start_idx:end_idx]
+            batch_bridges = eval_bridges[start_idx:end_idx]
+            batch_subjects = eval_subjects[start_idx:end_idx]
+            batch_cot_pred_bridges = cot_pred_bridges[start_idx:end_idx]
+
+            first_token_ids = []
+            for bridge in batch_bridges:
+                if not bridge or bridge in ('nan', 'null'):
+                    first_token_ids.append(tokenizer.unk_token_id)
+                    continue
+                tokens = tokenizer.encode(bridge.strip(), add_special_tokens=False)
+                first_token_ids.append(tokens[0] if tokens else tokenizer.unk_token_id)
+            eval_labels_chunk_list.append(first_token_ids)
+
+            # storing first token ids of cot_pred_bridges
+            cot_pred_bridges_first_token_ids = []
+            for bridge in batch_cot_pred_bridges:
+                if not bridge or bridge in ('nan', 'null'):
+                    cot_pred_bridges_first_token_ids.append(tokenizer.unk_token_id)
+                    continue
+                tokens = tokenizer.encode(bridge.strip(), add_special_tokens=False)
+                cot_pred_bridges_first_token_ids.append(tokens[0] if tokens else tokenizer.unk_token_id)
+            pred_bridge_labels_chunk_list.append(cot_pred_bridges_first_token_ids)
+
+            inputs = tokenizer(batch_prompts, padding=True, truncation=True, return_tensors='pt', max_length=512).to(device)
+
+            last_subject_token_positions = tokenization_utils.find_exact_substrings_token_positions_from_tensor(
+                tokenizer, inputs["input_ids"], batch_subjects
+            )
+
+            with torch.no_grad():
+                outputs = model(**inputs, output_hidden_states=True)
+                hidden = outputs.hidden_states[best_layer + 1]
+
+                seq_lens = inputs['attention_mask'].sum(dim=1) - 1
+                positions = [seq_lens[i].item() if pos < 0 else pos for i, pos in enumerate(last_subject_token_positions)]
+                positions = torch.tensor(positions, device=device)
+
+                batch_indices = torch.arange(hidden.size(0), device=device)
+                batch_hs = hidden[batch_indices, positions, :].cpu()
+                eval_hs_list.append(batch_hs)
+
+        if eval_dataset_responses_path is not None:
+            eval_recall_at_k, eval_mean_rank, cpf, per_sample_info = evaluate_on_dataset(
+                eval_hs_list, eval_labels_chunk_list, "eval_dataset", n_eval, pred_bridge_labels_chunk_list
+            )
+        else:
+            eval_recall_at_k, eval_mean_rank = evaluate_on_dataset(
+                eval_hs_list, eval_labels_chunk_list, "eval_dataset", n_eval
+            )
+
+        trained_probes[key]['metrics'][eval_dataset_name] = {
+            'eval_recall@{}'.format(top_k): eval_recall_at_k,
+            'eval_mean_rank': eval_mean_rank,
+            'eval_n_samples': n_eval,
+            'cpf': cpf if cpf is not None else {},
+        }
+    else:
+        eval_metric = trained_probes[key]['metrics'][eval_dataset_name]
+        eval_recall_at_k = eval_metric['eval_recall@{}'.format(top_k)]
+        eval_mean_rank = eval_metric['eval_mean_rank']
+
+    # ── per-sample 打标并写出 labeled jsonl ──────────────────────────────────
+    if per_sample_info is not None and cot_pred_bridges is not None:
+        # 计算 correct bridge 的 first token id
+        correct_token_ids = []
+        for bridge in eval_bridges:
+            if not bridge or bridge in ('nan', 'null'):
+                correct_token_ids.append(tokenizer.unk_token_id)
+            else:
+                tids = tokenizer.encode(bridge.strip(), add_special_tokens=False)
+                correct_token_ids.append(tids[0] if tids else tokenizer.unk_token_id)
+
+        # 计算 cot pred bridge 的 first token id
+        cot_token_ids = []
+        for bridge in cot_pred_bridges:
+            if not bridge or bridge in ('nan', 'null'):
+                cot_token_ids.append(tokenizer.unk_token_id)
+            else:
+                tids = tokenizer.encode(bridge.strip(), add_special_tokens=False)
+                cot_token_ids.append(tids[0] if tids else tokenizer.unk_token_id)
+
+        labeled_records = []
+        for i in range(n_eval):
+            probe_top1_tid = per_sample_info['probe_top1'][i]
+            cot_tid        = cot_token_ids[i]
+            correct_tid    = correct_token_ids[i]
+
+            labeled_records.append({
+                "index":                i,
+                "prompt":               eval_prompts[i],
+                "correct_bridge":       eval_bridges[i],
+                "pred_bridge":          cot_pred_bridges[i],
+                "correct_token_id":     correct_tid,
+                "cot_token_id":         cot_tid,
+                "probe_top1_token_id":  probe_top1_tid,        # 内部预测的 bridge
+                "ll_rank_correct":      per_sample_info['rank_correct'][i],
+                "ll_rank_cot":          per_sample_info['rank_cot'][i],
+                "correct_in_topk":      bool(per_sample_info['rank_correct'][i] <= top_k),
+                "used_cot_bridge":      bool(per_sample_info['cot_in_topk'][i]),   # CoT bridge 进入 probe top-k
+                # ── CPF 核心 label：内部表征与 CoT 是否一致 ──
+                "cot_matches_internal": (probe_top1_tid == cot_tid),   # probe top-1 == CoT pred（faithful）
+                "internal_correct":     (probe_top1_tid == correct_tid),
+                "cot_correct":          (cot_tid == correct_tid),
+            })
+
+        labeled_path = (
+            f"/scratch/yh6210/results/open-r1/twohop_results/"
+            f"{eval_dataset_name}_{model_name}_{seed}_results_{interp_tool}_labeled.jsonl"
+        )
+        os.makedirs(os.path.dirname(labeled_path), exist_ok=True)
+        with jsonlines.open(labeled_path, mode="w") as writer:
+            writer.write_all(labeled_records)
+        print(f"Per-sample labels saved to {labeled_path}")
+
+    # ================== 最终metric（合并train + 当前eval） ==================
+    metric = {
+        'layer': best_layer,
+        'train_recall@{}'.format(top_k): train_recall_at_k,
+        'train_mean_rank': train_mean_rank,
+        'train_n_samples': n_train,
+        'eval_recall@{}'.format(top_k): eval_recall_at_k,
+        'eval_mean_rank': eval_mean_rank,
+        'eval_n_samples': n_eval,
+        'cpf': cpf if cpf is not None else {},
+    }
+    print(f"Evaluation finished! "
+          f"Train Recall@{top_k}: {train_recall_at_k:.4f}, Train Mean Rank: {train_mean_rank:.2f} "
+          f"Eval ({eval_dataset_name}) Recall@{top_k}: {eval_recall_at_k:.4f}, Eval Mean Rank: {eval_mean_rank:.2f}")
+    print(f"CPF Results: {cpf if cpf is not None else 'None'}")
+
+    # 保存更新后的缓存
+    print('Saving trained probes to disk...')
+    torch.save(trained_probes, probe_cache_file)
+    print(f"Trained probes updated and saved to {probe_cache_file}")
+
+    # ── 保存结果到 jsonl ──────────────────────────────────────────────────
+    output_dir = f'/scratch/yh6210/results/open-r1/{eval_dataset_name}_{model_name}_{interp_tool}_{seed}_cpf_results'
+    os.makedirs(output_dir, exist_ok=True)
+
+    with jsonlines.open(output_path, mode='w') as writer:
+        writer.write(metric)
+
+    print(f"Results saved to {output_path}")
+
+    return metric
+
+
+
+
+# Hint Intervention
+# 这个很好判断hiddenstates内部，是否调用了Hint，来实现对应的任务
+
+
+# ====================== Hint Intervention Probe ======================
+def run_hint_linear_probe_evaluation(model, dataset: pd.DataFrame, dataset_name, tokenizer, batch_size=64):
+    """
+    Hint Intervention binary probe:
+    - 判断hidden state是否“调用了hint”（即依赖hint改变回答）
+    - 假设dataset (DataFrame) 包含以下列：
+        - 'prompt_with_hint': 带hint的prompt
+        - 'prompt_without_hint': 不带hint的prompt
+        - 'answer_changed': bool/int列，1=带hint后回答改变（positive），0=未改变（negative）
+    - 只收集answer_changed==1的with_hint hidden states作为positive
+    - 收集answer_changed==0的with_hint hidden states + 所有without_hint作为negative
+    - 训练binary linear probe (hidden_dim -> 2)
+    - 返回metric: acc, positive_prob_mean等
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    model.eval()
+
+    model_name = getattr(model.config, '_name_or_path', 'unknown_model').split('/')[-1]
+    key = (model_name, dataset_name + '_hint')
+
+    if key in trained_probes:
+        data = trained_probes[key]
+        print(f"Hint Probe already trained for Model {model_name} on Dataset {dataset_name} (layer {data['layer']})")
+        return data['metric']
+
+    print(f"starting to train Hint Intervention Linear Probe for Model {model_name} on Dataset {dataset_name}...")
+
+    # 检查必要列
+    req_cols = ['prompt_with_hint', 'prompt_without_hint', 'answer_changed']
+    for col in req_cols:
+        if col not in dataset.columns:
+            raise ValueError(f"DataFrame缺少必要列: {col}")
+
+    # 决定层（同two-hop）
+    n_layers = len(model.model.layers)
+    best_layer = best_layer_dict.get(key, n_layers // 2)
+    print(f"Using layer {best_layer}/{n_layers-1}")
+
+    # 提取并构建positive/negative samples
+    hs_pos = []  # with_hint 且 answer_changed==1
+    hs_neg = []  # with_hint 且 answer_changed==0 + 所有 without_hint
+
+    prompts_with = dataset['prompt_with_hint'].astype(str).tolist()
+    prompts_without = dataset['prompt_without_hint'].astype(str).tolist()
+    changed = dataset['answer_changed'].astype(int).tolist()
+    n_samples = len(prompts_with)
+
+    # 先收集所有without_hint hidden states（都作为negative）
+    for start_idx in tqdm(range(0, n_samples, batch_size), desc="Collecting without_hint hidden states (negative)"):
+        end_idx = min(start_idx + batch_size, n_samples)
+        batch_prompts = prompts_without[start_idx:end_idx]
+
+        inputs = tokenizer(batch_prompts, padding=True, truncation=True, return_tensors='pt', max_length=512).to(device)
+        with torch.no_grad():
+            outputs = model(**inputs, output_hidden_states=True)
+            hidden = outputs.hidden_states[best_layer + 1]
+            seq_lens = inputs['attention_mask'].sum(dim=1) - 1
+            batch_indices = torch.arange(hidden.size(0), device=device)
+            batch_hs = hidden[batch_indices, seq_lens, :].cpu()
+            hs_neg.append(batch_hs)
+
+    # 再收集with_hint hidden states（根据changed分正负）
+    for start_idx in tqdm(range(0, n_samples, batch_size), desc="Collecting with_hint hidden states"):
+        end_idx = min(start_idx + batch_size, n_samples)
+        batch_prompts = prompts_with[start_idx:end_idx]
+        batch_changed = changed[start_idx:end_idx]
+
+        inputs = tokenizer(batch_prompts, padding=True, truncation=True, return_tensors='pt', max_length=512).to(device)
+        with torch.no_grad():
+            outputs = model(**inputs, output_hidden_states=True)
+            hidden = outputs.hidden_states[best_layer + 1]
+            seq_lens = inputs['attention_mask'].sum(dim=1) - 1
+            batch_indices = torch.arange(hidden.size(0), device=device)
+            batch_hs = hidden[batch_indices, seq_lens, :].cpu()
+
+            # 分割正负
+            for i, ch in enumerate(batch_changed):
+                if ch == 1:
+                    hs_pos.append(batch_hs[i:i+1])
+                else:
+                    hs_neg.append(batch_hs[i:i+1])
+
+    # 合并
+    if len(hs_pos) == 0:
+        raise ValueError("No positive samples (answer_changed==1) found!")
+    hs_pos = torch.cat(hs_pos, dim=0)
+    hs_neg = torch.cat(hs_neg, dim=0)
+
+    # 平衡采样（取min大小）
+    min_size = min(len(hs_pos), len(hs_neg))
+    hs_pos = hs_pos[:min_size]
+    hs_neg = hs_neg[:min_size]
+
+    hs = torch.cat([hs_pos, hs_neg], dim=0)
+    labels = torch.cat([torch.ones(len(hs_pos)), torch.zeros(len(hs_neg))]).long()
+
+    # ================== 训练Binary Probe ==================
+    hidden_dim = hs.shape[1]
+    probe = nn.Linear(hidden_dim, 2).to(device)  # binary
+    hs_device = hs.to(device)
+
+    dataset_probe = TensorDataset(hs_device, labels.to(device))
+    train_loader = DataLoader(dataset_probe, batch_size=batch_size, shuffle=True)
+
+    optimizer = torch.optim.AdamW(probe.parameters(), lr=1e-3, weight_decay=0.01)
+    criterion = nn.CrossEntropyLoss()
+
+    probe.train()
+    n_epochs = 20
+    for epoch in range(n_epochs):
+        total_loss = 0.0
+        for batch_hs, batch_labels in train_loader:
+            optimizer.zero_grad()
+            logits = probe(batch_hs)
+            loss = criterion(logits, batch_labels)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        print(f"Epoch {epoch + 1}/{n_epochs} - Loss: {total_loss / len(train_loader):.4f}")
+
+    # ================== 评估 ==================
+    probe.eval()
+    with torch.no_grad():
+        logits = probe(hs_device)
+        preds = logits.argmax(dim=-1)
+        acc = (preds == labels.to(device)).float().mean().item()
+        pos_prob = torch.softmax(logits, dim=-1)[:, 1].mean().item()  # positive class概率均值
+
+    metric = {
+        'layer': best_layer,
+        'accuracy': acc,
+        'mean_positive_prob': pos_prob,
+        'n_pos': len(hs_pos),
+        'n_neg': len(hs_neg)
+    }
+    print(f"Hint Probe Training finished! Acc: {acc:.4f}, Mean Positive Prob: {pos_prob:.4f}")
+
+    trained_probes[key] = {'probe': probe.cpu(), 'layer': best_layer, 'metric': metric}
+    return metric
+
+
+# ====================== Math/Multiplication Probe ======================
+def run_math_linear_probe_evaluation(model, dataset: pd.DataFrame, dataset_name, tokenizer, batch_size=64, top_k=200):
+    """
+    Math/Multiplication probe（类似two-hop）:
+    - 判断hidden state是否包含特定中间数字/计算步骤
+    - 假设dataset (DataFrame) 包含列：
+        - 'prompt': multiplication prompt（e.g., "123 * 456 = "）
+        - 'intermediate': 中间计算步骤的数字文本（e.g., "56088" 或 partial product）
+    - 预测intermediate的first token（同two-hop bridge）
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    model.eval()
+
+    model_name = getattr(model.config, '_name_or_path', 'unknown_model').split('/')[-1]
+    key = (model_name, dataset_name + '_math')
+
+    if key in trained_probes:
+        data = trained_probes[key]
+        print(f"Math Probe already trained for Model {model_name} on Dataset {dataset_name} (layer {data['layer']})")
+        return data['metric']
+
+    print(f"starting to train Math Intermediate Linear Probe for Model {model_name} on Dataset {dataset_name}...")
+
+    # 检查列
+    prompt_col = 'prompt'
+    intermediate_col = 'intermediate'
+    if prompt_col not in dataset.columns or intermediate_col not in dataset.columns:
+        raise ValueError(f"DataFrame缺少必要列: {prompt_col} 或 {intermediate_col}")
+
+    # 决定层
+    n_layers = len(model.model.layers)
+    best_layer = best_layer_dict.get(key, n_layers // 2)
+    print(f"Using layer {best_layer}/{n_layers-1}")
+
+    prompts = dataset[prompt_col].astype(str).tolist()
+    intermediates = dataset[intermediate_col].astype(str).tolist()
+    n_samples = len(prompts)
+
+    # ================== 收集hidden states ==================
+    hs_list = []
+    labels_list = []
+
+    for start_idx in tqdm(range(0, n_samples, batch_size), desc="Collecting hidden states"):
+        end_idx = min(start_idx + batch_size, n_samples)
+        batch_prompts = prompts[start_idx:end_idx]
+        batch_inter = intermediates[start_idx:end_idx]
+
+        first_token_ids = []
+        for inter in batch_inter:
+            if not inter or inter == 'nan':
+                first_token_ids.append(tokenizer.unk_token_id)
+                continue
+            tokens = tokenizer.encode(inter.strip(), add_special_tokens=False)
+            first_token_ids.append(tokens[0] if tokens else tokenizer.unk_token_id)
+        labels_list.extend(first_token_ids)
+
+        inputs = tokenizer(batch_prompts, padding=True, truncation=True, return_tensors='pt', max_length=512).to(device)
+        with torch.no_grad():
+            outputs = model(**inputs, output_hidden_states=True)
+            hidden = outputs.hidden_states[best_layer + 1]
+            seq_lens = inputs['attention_mask'].sum(dim=1) - 1
+            batch_indices = torch.arange(hidden.size(0), device=device)
+            batch_hs = hidden[batch_indices, seq_lens, :].cpu()
+            hs_list.append(batch_hs)
+
+    hs = torch.cat(hs_list, dim=0)
+    labels = torch.tensor(labels_list)
+
+    # ================== 训练 & 评估（同two-hop） ==================
+    hidden_dim = hs.shape[1]
+    vocab_size = len(tokenizer)
+
+    probe = nn.Linear(hidden_dim, vocab_size).to(device)
+    hs_device = hs.to(device)
+
+    probe_dataset = TensorDataset(hs_device, labels.to(device))
+    train_loader = DataLoader(probe_dataset, batch_size=batch_size, shuffle=True)
+
+    optimizer = torch.optim.AdamW(probe.parameters(), lr=1e-3, weight_decay=0.01)
+    criterion = nn.CrossEntropyLoss()
+
+    probe.train()
+    n_epochs = 20
+    for epoch in range(n_epochs):
+        total_loss = 0.0
+        for batch_hs, batch_labels in train_loader:
+            optimizer.zero_grad()
+            logits = probe(batch_hs)
+            loss = criterion(logits, batch_labels)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        print(f"Epoch {epoch + 1}/{n_epochs} - Loss: {total_loss / len(train_loader):.4f}")
+
+    probe.eval()
+    with torch.no_grad():
+        logits = probe(hs_device)
+        topk_indices = torch.topk(logits, k=top_k, dim=-1).indices
+        correct = (topk_indices == labels.to(device).unsqueeze(1)).any(dim=1)
+        recall_at_k = correct.float().mean().item()
+
+        ranks = [(logits[i].argsort(descending=True) == labels[i].to(device)).nonzero().item() + 1 for i in range(logits.shape[0])]
+        mean_rank = np.mean(ranks)
+
+    metric = {
+        'layer': best_layer,
+        'recall@{}'.format(top_k): recall_at_k,
+        'mean_rank': mean_rank,
+        'n_samples': n_samples
+    }
+    print(f"Math Probe Training finished! Recall@{top_k}: {recall_at_k:.4f}, Mean Rank: {mean_rank:.2f}")
+
+    trained_probes[key] = {'probe': probe.cpu(), 'layer': best_layer, 'metric': metric}
+    return metric
+
+
+
+# tasks_data = {
+#     "task1": {"X_train": X_train1, "y_train": y_train1, "X_test": X_test1, "y_test": y_test1, "max_iter": 500},
+#     "task2": {"X_train": X_train2, "y_train": y_train2, "X_test": X_test2, "y_test": y_test2, "max_iter": 1000},
+#     "task3": {"X_train": X_train3, "y_train": y_train3, "X_test": X_test3, "y_test": y_test3, "max_iter": 1500},
+# }
+#
+# probe = LinearProbe()
+#
+# for task_name, data in tasks_data.items():
+#     probe.fit(data["X_train"], data["y_train"], task_name, max_iter=data["max_iter"])
+#     result = probe.evaluate(data["X_test"], data["y_test"], task_name)
+#     print(f"{task_name} accuracy: {result['linear_probe_acc']}, training info: {result['task_info']}")
