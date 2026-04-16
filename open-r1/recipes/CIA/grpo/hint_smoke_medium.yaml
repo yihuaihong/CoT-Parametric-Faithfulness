@@ -1,0 +1,65 @@
+# MEDIUM SMOKE — 10 steps, G=8, realistic lengths, ~180 train samples.
+# Use to verify reward curve behavior before committing to full training.
+# Usage:
+#   sbatch --export=ALL,CONFIG=recipes/CIA/grpo/hint_smoke_medium.yaml,CIA_DEV_FRAC=10,ACC_CFG=recipes/accelerate_configs/zero2.yaml sbatch/grpo_hint.sbatch
+
+model_name_or_path: /scratch/yh6210/transformers/Meta-Llama-3-8B-Instruct
+model_revision: main
+torch_dtype: bfloat16
+attn_implementation: sdpa
+
+dataset_name: /scratch/yh6210/open-r1/datasets/Hint_MMLU_cia
+dataset_config: default
+dataset_prompt_column: problem
+dataset_train_split: train
+dataset_test_split: validation
+
+reward_funcs:
+  - hint_accuracy
+  - hint_parametric_faithfulness
+reward_weights:
+  - 1.0
+  - 1.0
+
+num_generations: 8                # G=8 — enough variance for real advantage signal
+temperature: 1.0
+top_p: 1.0
+beta: 0.01
+epsilon: 0.2
+learning_rate: 1.0e-06
+lr_scheduler_type: cosine_with_min_lr
+lr_scheduler_kwargs:
+  min_lr_rate: 0.1
+warmup_ratio: 0.0
+num_train_epochs: 1
+max_steps: 10                     # 10 training steps
+max_prompt_length: 1024           # realistic; enough for MMLU + hint
+max_completion_length: 1024       # realistic; needed for Qwen-style long CoT
+
+per_device_train_batch_size: 1    # conservative on 2× H200 with G=8
+gradient_accumulation_steps: 2
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+bf16: true
+use_liger_kernel: false
+use_vllm: false
+optim: adamw_bnb_8bit          # save ~28GB optim on 2× H100; ~5% speed hit, <1% quality
+
+log_completions: true
+log_level: info
+logging_first_step: true
+logging_steps: 1
+logging_strategy: steps
+save_strategy: "no"
+output_dir: /scratch/yh6210/open-r1/cia/hint_llama3_8b_grpo_smoke_medium
+overwrite_output_dir: true
+push_to_hub: false
+report_to:
+  - wandb
+wandb_project: cia-grpo
+wandb_run_name: hint-llama3-8b-smoke-medium
+seed: 42
+do_eval: false
+eval_strategy: 'no'
+per_device_eval_batch_size: 1

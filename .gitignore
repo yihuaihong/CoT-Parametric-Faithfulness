@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Logs & outputs
+logs/
+*.log
+*.out
+*.err
+output.log
+wandb/
+.triton/
+
+# Data & model artifacts (too large for git)
+results/
+*.jsonl
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.tar.gz
+
+# HF datasets cache
+.huggingface/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Sensitive
+.netrc
+*.key

@@ -1,0 +1,63 @@
+# Test B: 2× H100 ZeRO-3 + bnb, but grad_checkpointing OFF.
+# Hypothesis: gradient checkpointing re-forwards during backward
+# interacting with ZeRO-3 param gather, corrupting something.
+# If completions are coherent here, the fault is ckpt × ZeRO-3.
+
+model_name_or_path: /scratch/yh6210/transformers/Meta-Llama-3-8B-Instruct
+model_revision: main
+torch_dtype: bfloat16
+attn_implementation: sdpa
+
+dataset_name: /scratch/yh6210/open-r1/datasets/Hint_MMLU_cia
+dataset_config: default
+dataset_prompt_column: problem
+dataset_train_split: train
+dataset_test_split: validation
+
+reward_funcs:
+  - hint_accuracy
+  - hint_parametric_faithfulness
+reward_weights:
+  - 1.0
+  - 1.0
+
+num_generations: 4
+temperature: 1.0
+top_p: 1.0
+beta: 0.01
+epsilon: 0.2
+learning_rate: 1.0e-06
+lr_scheduler_type: cosine_with_min_lr
+lr_scheduler_kwargs:
+  min_lr_rate: 0.1
+warmup_ratio: 0.0
+num_train_epochs: 1
+max_steps: 5
+max_prompt_length: 512
+max_completion_length: 512
+
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 2
+gradient_checkpointing: false            # ← TURNED OFF
+bf16: true
+use_liger_kernel: false
+use_vllm: false
+optim: adamw_bnb_8bit
+
+log_completions: true
+log_level: info
+logging_first_step: true
+logging_steps: 1
+logging_strategy: steps
+save_strategy: "no"
+output_dir: /scratch/yh6210/open-r1/cia/smoke_noz3_nockpt
+overwrite_output_dir: true
+push_to_hub: false
+report_to:
+  - wandb
+wandb_project: cia-grpo
+wandb_run_name: smoke_z3_bnb_nockpt
+seed: 42
+do_eval: false
+eval_strategy: 'no'
+per_device_eval_batch_size: 1
